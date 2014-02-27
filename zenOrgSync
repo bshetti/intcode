@@ -1,0 +1,249 @@
+#!/usr/bin/python
+# This script helps create a crucible review with a patch file. 
+from __future__ import with_statement
+#import ipdb; ipdb.set_trace()
+import sys
+import os
+import argparse
+import string
+import subprocess
+import tempfile
+from datetime import datetime
+from fabric.api import local, settings, abort
+from fabric.state import output
+# REST Client
+import requests
+from requests.auth import HTTPBasicAuth
+
+# serialize stuff
+import json
+
+# Reinitialize httplib2 because .cache dirs suck
+import httplib2
+
+# get urllib for downloading urls
+import urllib2
+
+
+# Play nice with 'with' statements
+from contextlib import contextmanager
+
+#namedtuple
+import collections
+
+from collections import namedtuple
+
+# import Jira library
+from jira.client import JIRA
+
+#import a password read mechanism
+import getpass
+
+from simple_salesforce import Salesforce
+
+import datetime
+
+logFileName = "/home/bshetti/log/zenOrgSync.log"
+
+#class Logger(object):
+#    def __init__(self, filename="Default.log"):
+#        self.terminal = sys.stdout
+#        self.log = open(filename, "a")
+
+#    def write(self, message):
+#        self.terminal.write(message)
+#        self.log.write(message)
+
+#sys.stdout = Logger("/home/bshetti/zenOrgSync.log")
+
+sys.stdout = open(logFileName, "a")
+
+def getOrgList():
+
+	theOrgList = {}
+
+	rn = requests.get('https://youcompany.zendesk.com/api/v2/organizations.json', auth=HTTPBasicAuth('user', 'password'))
+	if rn.status_code == 200:
+
+		zOrgList = rn.json()
+
+		i=0
+
+		while i > -1:
+
+			try:
+				orgName = str(zOrgList["organizations"][i]["name"]).encode('ascii')
+
+			except IndexError:
+				i = -1
+
+			else:
+				orgId = str(zOrgList["organizations"][i]["id"]).encode('ascii')
+				theOrgList[orgName] = orgId
+				i = i+1
+
+	else:
+		print "Could not get org list"
+		return 0
+
+	return theOrgList
+
+
+def getUsersList():
+
+	theUserList = {}
+
+	rn = requests.get('https://youcompany.zendesk.com/api/v2/users.json', auth=HTTPBasicAuth('user', 'password'))
+	if rn.status_code == 200:
+
+		zUserList = rn.json()
+
+		i=0
+
+		while i > -1:
+
+			try:
+				userEmail = str(zUserList["users"][i]["email"]).encode('ascii')
+
+			except IndexError:
+				i = -1
+
+			else:
+				userId = str(zUserList["users"][i]["id"]).encode('ascii')
+				userOrg = str(zUserList["users"][i]["organization_id"])
+
+#				print "User info", userEmail, userId, userOrg
+
+				if userOrg == 'None':
+					theUserList[userEmail] = userId
+
+				i = i +1
+
+	else:
+		print "Could not get user list"
+		return 0
+
+	return theUserList
+
+def updateUser(userId, orgId):
+
+	zenPayload = {'user': {'organization_id': str(orgId)}}
+	headers = {'content-type': 'application/json'}
+
+	rn = requests.put('https://yourcompany.zendesk.com/api/v2/users/'+userId+'.json', data=json.dumps(zenPayload), headers=headers, auth=HTTPBasicAuth('user', 'password'))
+
+	if rn.status_code == 200:
+		print "Updated user"
+		return 1
+	else:
+		print "Error updating user", userId
+
+		return 0
+
+
+def addCompany(companyName):
+
+	zenPayload = {"organization": {"name": str(companyName)}}
+
+	headers = {'content-type': 'application/json'}
+
+	rn = requests.post('https://yourcompany.zendesk.com/api/v2/organizations.json', data=json.dumps(zenPayload), headers =headers, auth=HTTPBasicAuth('user', 'password'))
+
+
+	if rn.status_code in (200, 201):
+		print "Added organization"
+		zOrgData = rn.json()
+		orgId = str(zOrgData["organization"]["id"]).encode('ascii')
+		print "Organization id is ", orgId
+		return orgId
+	else:
+		print "Error adding organization ", companyName
+
+		return 0
+
+
+
+
+def checkSalesForce(orgList, userList):
+
+	sf = Salesforce(username='user', password='password', security_token='TOKEN')
+
+	users = iter(userList)
+
+	i = 0
+
+	while i > -1:
+		try:
+			userEmail = users.next()
+
+		except StopIteration:
+			print "End of user List"
+			i = -1
+
+		else:
+			userId = userList[userEmail]
+			query = "SELECT Account.Name, ServiceAccess__c FROM Contact WHERE Email='"+userEmail+"'"
+			print "Checking email, userId ", userEmail, userId
+			output = sf.query(str(query))
+
+			if output["totalSize"] == 0:
+				print "Could not find email in salesforce", userEmail
+			else:
+				companyName = output["records"][0]["Account"]["Name"]
+				serviceAccess = output["records"][0]["ServiceAccess__c"]
+
+				if serviceAccess == True:
+					print "Has Access ", userEmail
+					
+					if orgList.has_key(companyName) == True:
+						orgId = orgList[companyName]
+						print "Retreived ", companyName, orgId
+
+						if updateUser(userId, orgList[companyName]):
+							print "Success updating user"
+						else:
+							print "could not update user"
+					else:
+						print "Could not find "+companyName+" in zendesk. Will add into zendesk"
+						orgId = addCompany(companyName)
+						if orgId:
+							orgList[companyName] = orgId
+							if updateUser(userId, orgId):
+								print "Success updating user"
+							else:
+								print "count not update user"
+				else:
+					print "No access allowed for ", userEmail
+
+			i = i+1
+
+
+
+def main():
+
+	print "===================== begin of run =============="
+	print "zenOrgSync run at: "+str(datetime.datetime.now())
+	
+	orgList = getOrgList()
+	if orgList != 0:
+		if orgList:
+			print "OrgList obtained and not empty"
+			print json.dumps(orgList, sort_keys=False, indent=4, separators=(',',':'))
+	else:
+		print "orgList is empty"
+
+
+#	userList = getUsersList()
+#	if userList != 0:
+#		if userList:
+#			checkSalesForce(orgList, userList)
+#		else:
+#			print "userList is empty"
+#	else:
+#		print "userList is empty"
+
+	print "====end of run==========================="
+
+ 
+if __name__ == '__main__':
+    main()

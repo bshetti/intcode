@@ -1,0 +1,174 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+import logging
+import MySQLdb as mdb
+import sys
+import time
+from datetime import datetime, timedelta
+
+#logging info
+logging.basicConfig()
+logger = logging.getLogger("stageD")
+hdlr = logging.FileHandler("/home/bshetti/log/stageD.log")
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+hdlr.setFormatter(formatter)
+logger.addHandler(hdlr)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+def getOpportunityHistory():
+
+	con = mdb.connect('sqlserver', 'user', 'password', 'dbname', 3306)
+
+	with con:
+
+		cur = con.cursor(mdb.cursors.DictCursor)
+		cur.execute("select sfoh.*, sfo.sfName \
+			from sfOpportunityHistory as sfoh \
+			join sfOpportunity as sfo on sfo.sfId = sfoh.sfOpportunityId \
+			order by sfo.sfName ASC, sfoh.sfCreatedDate ASC")
+
+		rows = cur.fetchall()
+
+#		for row in rows:
+
+#			print row['sfName'], row['sfCreatedDate'], row['sfStageName'], row['sfAmount'], row['sfProbability'], row['sfCloseDate']
+
+	return rows
+
+def createStageTable(rows):
+	con = mdb.connect('sqlserver', 'user', 'password', 'dbname', 3306)
+
+	with con:
+		cur = con.cursor()
+		cur.execute("drop table if exists stageduration")
+		cur.execute("create table stageduration(Id int primary key auto_increment,  \
+			OpportunityId varchar(18), \
+			Name varchar(360), \
+			Prospecting decimal(18,0), \
+			Qualification decimal(18,0), \
+			HardwareProcurement decimal(18,0), \
+			TechnicalPOC decimal(18,0), \
+			Proposal decimal(18,0), \
+			ClosedWon decimal(18,0), \
+			ClosedLost decimal(18,0), \
+			Hold decimal(18,0) )")
+
+		OpportunityId = rows[0]['sfOpportunityId']
+		oppName = rows[0]['sfName']
+		cur.execute("insert into stageduration(OpportunityId, Name) values(%s, %s)", (OpportunityId, oppName))
+
+		for row in rows:
+			if oppName != row['sfName']:
+				OpportunityId = row['sfOpportunityId']
+				oppName = row['sfName']
+				cur.execute("insert into stageduration(OpportunityId, Name) values(%s, %s)", (OpportunityId, oppName))
+
+
+def days_between(d1, d2):
+    d1 = datetime.strptime(str(d1), "%Y-%m-%d %H:%M:%S")
+    d2 = datetime.strptime(str(d2), "%Y-%m-%d %H:%M:%S")
+    return abs((d2 - d1).days)
+
+
+def fillDurations(rows):
+	con = mdb.connect('sqlserver', 'user', 'password', 'dbname', 3306)
+
+	with con:
+		cur = con.cursor()
+
+		OpportunityId = rows[0]['sfOpportunityId']
+		stageStartDate = rows[0]['sfCreatedDate']
+		stageName = rows[0]['sfStageName']
+		if stageName == "Technical POC":
+			stageName = "Technical Validation"
+		oppName = rows[0]['sfName']
+
+
+		stageD = {'Prospecting': 0, "Qualification": 0, \
+				"Hardware Procurement": 0, "Technical Validation": 0, \
+				 "Proposal/Price Quote":0, "Closed Won":0, \
+				 "Closed Lost": 0, "Hold":0}
+
+		totalRows = len(rows)
+		oppRows = 1
+
+		for row in rows:
+			if OpportunityId != row['sfOpportunityId']:
+				duration = days_between(stageStartDate, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+				stageD[stageName] += duration
+				logger.info("inserting opportunity %s ", oppName)
+				updateString = "update stageduration set Prospecting="+str(stageD['Prospecting'])+\
+						", Qualification="+str(stageD['Qualification'])+\
+						", HardwareProcurement="+str(stageD['Hardware Procurement'])+\
+						", TechnicalPOC="+str(stageD['Technical Validation'])+\
+						", Proposal="+str(stageD['Proposal/Price Quote'])+\
+						", ClosedWon="+str(stageD['Closed Won'])+\
+						", ClosedLost="+str(stageD['Closed Lost'])+\
+						", Hold="+str(stageD['Hold'])+\
+						" where OpportunityId='"+str(OpportunityId)+"'"
+				cur.execute(updateString)
+				stageD = {'Prospecting': 0, "Qualification": 0, \
+						"Hardware Procurement": 0, "Technical Validation": 0, \
+						"Proposal/Price Quote":0, "Closed Won":0, \
+						"Closed Lost": 0, "Hold":0}
+				OpportunityId = row['sfOpportunityId']
+				stageStartDate = row['sfCreatedDate']
+				stageName = row['sfStageName']
+				if stageName == "Technical POC":
+					stageName = "Technical Validation"
+
+				oppName = row['sfName']
+				oppRows = 1
+
+			if row['sfStageName'] != stageName:
+				duration = days_between(stageStartDate, row['sfCreatedDate'])
+				stageD[stageName] += duration
+				stageStartDate = row['sfCreatedDate']
+				stageName = row['sfStageName']
+				if stageName == "Technical POC":
+					stageName = "Technical Validation"
+
+				oppRows += 1
+
+#		print "the last opportunity has X rows", oppRows
+
+		duration = days_between(stageStartDate, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+		stageD[stageName] += duration
+		updateString = "update stageduration set Prospecting="+str(stageD['Prospecting'])+\
+				", Qualification="+str(stageD['Qualification'])+\
+				", HardwareProcurement="+str(stageD['Hardware Procurement'])+\
+				", TechnicalPOC="+str(stageD['Technical Validation'])+\
+				", Proposal="+str(stageD['Proposal/Price Quote'])+\
+				", ClosedWon="+str(stageD['Closed Won'])+\
+				", ClosedLost="+str(stageD['Closed Lost'])+\
+				", Hold="+str(stageD['Hold'])+\
+				" where OpportunityId='"+str(OpportunityId)+"'"
+		cur.execute(updateString)
+		
+
+def main():
+	logger.info("Starting run ======= %s", time.strftime("%c"))
+	rows = getOpportunityHistory()
+#	print rows[0]['sfName']
+	for row in rows:
+
+		logger.info("%s, %s, %s, %s, %s, %s", row['sfName'], row['sfCreatedDate'], row['sfStageName'], row['sfAmount'], row['sfProbability'], row['sfCloseDate'])
+	createStageTable(rows)
+	fillDurations(rows)
+	logger.info("Ending run =========")
+#	print rows
+#	main()
+
+if __name__ == '__main__':
+
+	try:
+		main()
+	except Exception, e:
+		logger.error(e)
+#        log.error("Something went very wrong ->" + e.message)
+	finally:
+# finallzia my stuff
+		pass

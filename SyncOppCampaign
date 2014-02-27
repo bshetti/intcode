@@ -1,0 +1,431 @@
+#!/usr/bin/python
+# This script helps create a crucible review with a patch file.
+
+from __future__ import with_statement
+#import ipdb; ipdb.set_trace()
+import sys
+import traceback
+import os
+import argparse
+import string
+import subprocess
+import tempfile
+from datetime import datetime
+from fabric.api import local, settings, abort
+from fabric.state import output
+# REST Client
+import requests
+from requests.auth import HTTPBasicAuth
+
+# serialize stuff
+import json
+
+# Reinitialize httplib2 because .cache dirs suck
+import httplib2
+
+# get urllib for downloading urls
+import urllib2
+
+import urllib
+from urllib import quote
+
+
+
+# Play nice with 'with' statements
+from contextlib import contextmanager
+
+#namedtuple
+import collections
+
+from collections import namedtuple
+
+#import a password read mechanism
+import getpass
+
+from simple_salesforce import Salesforce
+from simple_salesforce.api import SalesforceMalformedRequest
+
+import datetime
+import math
+from math import ceil
+
+import logging
+#logging info
+logging.basicConfig()
+logger = logging.getLogger("sync-campaign")
+hdlr = logging.FileHandler("/home/bshetti/log/syncOpp.log")
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+hdlr.setFormatter(formatter)
+logger.addHandler(hdlr)
+logger.setLevel(logging.DEBUG)
+logger.propagate = False
+
+
+def getCampaigns(sf):
+
+	campaigns = {}
+
+
+	query = "SELECT Campaign.Name, Campaign.Id FROM Campaign"
+
+	try:
+		output = sf.query(str(query))
+	except Exception, e:
+		logger.error(e)
+		sys.exit(1)
+
+	try:
+		totalSize = output["totalSize"]
+	except Exception, e:
+		exc_type, exc_value, exc_traceback = sys.exc_info()
+		logger.error("The errors for getting totalSize in getCampaigns are:", exc_info = (exc_type, exc_value, exc_traceback))
+		logger.error("Exiting getCampaign")
+		sys.exit()
+
+
+	if totalSize == 0:
+		logger.error("Could not find campaigns in salesforce")
+	else:
+
+		i = 0
+
+		while i > -1:
+			try:
+				campaignName = str(output["records"][i]["Name"]).encode('ascii')
+
+			except IndexError:
+				i = -1
+
+			else:
+
+
+				campaignId = str(output["records"][i]["Id"]).encode('ascii')
+				campaigns[campaignName] = campaignId
+				i = i+1
+
+	return campaigns
+
+
+
+def getOpportunities(sf):
+
+	opportunity = {}
+
+	query = "SELECT Opportunity.Name, Opportunity.Id, Opportunity.Lead_Source_Campaign__c, Opportunity.LeadSource, Opportunity.Source_Lead_Id__c, Opportunity.CampaignId FROM Opportunity"
+
+
+	try:
+		output = sf.query(str(query))
+	except Exception, e:
+		logger.error(e)
+		sys.exit(1)
+
+	try:
+		totalSize = output["totalSize"]
+	except Exception, e:
+		exc_type, exc_value, exc_traceback = sys.exc_info()
+		logger.error("The errors for getting totalSize in getCampaigns are:", exc_info = (exc_type, exc_value, exc_traceback))
+		logger.error("Exiting getCampaign")
+		sys.exit()
+
+	if totalSize == 0:
+		print "Could not find Opportunities in salesforce"
+	else:
+
+		i = 0
+		oi = 0
+
+		while i > -1:
+
+			opportunityInfo = {}
+			
+			try:
+				oppName = str(output["records"][i]["Name"]).encode('ascii')
+
+			except IndexError:
+				i = -1
+
+			else:
+				if str(output["records"][i]["CampaignId"]).encode('ascii') == 'None':
+
+					leadSource = str(output["records"][i]["LeadSource"]).encode('ascii')
+
+					if (leadSource != 'Employee Referral' and leadSource != 'Trade Show (no booth)' and leadSource != 'External Referral' and leadSource != 'Channel Partner'):
+						opportunityInfo["Name"] = str(output["records"][i]["Name"]).encode('ascii')
+						opportunityInfo["Source_Lead_Id__c"] = str(output["records"][i]["Source_Lead_Id__c"]).encode('ascii')
+						opportunityInfo["LeadSource"] = str(output["records"][i]["LeadSource"]).encode('ascii')
+						opportunityInfo["Id"] = str(output["records"][i]["Id"]).encode('ascii')
+						opportunityInfo["Lead_Source_Campaign__c"] = str(output["records"][i]["Lead_Source_Campaign__c"]).encode('ascii')
+						opportunityInfo["CampaignId"] = str(output["records"][i]["CampaignId"]).encode('ascii')
+
+						opportunity[oi] = opportunityInfo
+						oi = oi+1
+
+				i = i+1
+
+	return opportunity
+
+def setSourceCampaign(sf, sourceCampaign, opportunityId, campaigns):
+
+#	print "In set Source and sourceCampaign is:", sourceCampaign
+
+
+
+	if sourceCampaign != None:
+		if sourceCampaign in campaigns.keys():
+			campaignId = campaigns[sourceCampaign]
+			try:
+				r = sf.Opportunity.update(str(opportunityId),{ 'CampaignId': str(campaignId)})
+			except SalesforceMalformedRequest:
+				message = "Error updating record for oppId "+opportunityId+" with campaignId:"+campaignId
+				logger.error(str(message))
+			except Exception, e:
+				exc_type, exc_value, exc_traceback = sys.exc_info()
+				message = "Error updating record for oppId "+opportunityId+" with campaignId:"+campaignId
+				logger.error(str(message))
+				logger.error("Exception for updating oppid with campaign is:", exc_info = (exc_type, exc_value, exc_traceback))
+			else:
+				message = "Source for opp done:", sourceCampaign, opportunityId
+				logger.info(str(message))
+				return 1
+		else:
+			message = "Source Campaign ", sourceCampaign, " for opp:", opportunityId, " is not in SFDC, opp. not amended"
+			logger.error(str(message))
+
+	return 0
+
+
+def changeCampaign(sf,campaigns, opportunity):
+
+	totalOpps = len(opportunity)
+
+
+
+	i = 0
+
+	while i<totalOpps:
+
+		leadSource = opportunity[i]["LeadSource"]
+
+		opportunityId = opportunity[i]["Id"]
+		sourceCampaign = opportunity[i]["Lead_Source_Campaign__c"]
+		leadSourceId = opportunity[i]["Source_Lead_Id__c"]
+
+
+		if (leadSource == 'Employee Referral' or leadSource == 'Trade Show (no booth)' or leadSource == 'External Referral' or leadSource == 'Partner'):
+			logger.debug("leadsource for X is employee, external or partner %s", opportunityId)
+			i=i+1
+			continue
+
+
+		opportunityId = opportunity[i]["Id"]
+		sourceCampaign = opportunity[i]["Lead_Source_Campaign__c"]
+		leadSourceId = opportunity[i]["Source_Lead_Id__c"]
+
+		logger.debug("Working on opp X %s", opportunityId)
+
+#Use sourceCampaign from Opportunity to set primary campaign
+
+		if setSourceCampaign(sf,sourceCampaign, opportunityId, campaigns) == 1:
+			logger.info("Successfully added from leadSourceCampaing field in opp record  for %s", opportunityId)
+			i=i+1
+			continue
+
+
+#use lead info to set Primary Campaign
+
+		if leadSourceId != 'None':
+			leadInfo = sf.Lead.get(str(leadSourceId))
+			contactId = leadInfo["ConvertedContactId"]
+
+#use contact info if it exists
+			if contactId != None:
+				try:
+					contactInfo = sf.Contact.get(str(contactId))
+				except Exception, e:
+					exc_type, exc_value, exc_traceback = sys.exc_info()
+					message = "Error getting contactId for "+contactId+" in changeCampaign for opportunity "+opportunityId+" from lead"+leadSourceId
+					logger.error(str(message))
+					logger.error("Exception for getting contact is:", exc_info = (exc_type, exc_value, exc_traceback))
+					i = i+1
+					sys.exit()
+				else:
+					sourceCampaign = contactInfo["Lead_Source_Campaign__c"]
+
+				if setSourceCampaign(sf,sourceCampaign, opportunityId, campaigns) == 1:
+					logger.info("Successfully added from contactId's leadSourceCampaign for %s by getting it via leadID", opportunityId)
+					i=i+1
+					continue
+
+#try lead's leadsource Campaign if it exists
+
+			
+			sourceCampaign = leadInfo["Lead_Source_Campaign__c"]
+			if sourceCampaign != None:
+
+				if setSourceCampaign(sf,sourceCampaign, opportunityId, campaigns) == 1:
+					logger.info("Successfully added from lead's leadsourceCampaign field for %s", opportunityId)
+					i=i+1
+					continue
+
+
+#Get contactRoles
+
+		soqlQuery = "SELECT ContactId, OpportunityId, Role, CreatedDate from OpportunityContactRole where OpportunityId='"+str(opportunityId)+"'"
+		
+		try:
+			contactRoles = sf.query(soqlQuery)
+		except Exception, e:
+			exc_type, exc_value, exc_traceback = sys.exc_info()
+			message = "Error getting contact roles for opportunity "+opportunityId
+			logger.error(str(message))
+			logger.error("Exception for getting contact roles is:", exc_info = (exc_type, exc_value, exc_traceback))
+			i = i+1
+			sys.exit()
+
+
+		totalCRs = contactRoles["totalSize"]
+
+		if totalCRs == 0:
+			i=i+1
+			continue
+
+		if totalCRs > 1:
+			contacts = {}
+			sortedContacts = {}
+
+			print "More than 1 contact role obtained"
+
+			initialContactId = contactRoles["records"][0]["ContactId"]
+
+# Get contacts
+			x = 0
+			while x < totalCRs:
+				contactId = contactRoles["records"][x]["ContactId"]
+				contact = sf.Contact.get(str(contactId))
+
+				date = contact["CreatedDate"]
+
+				contacts[str(contactId)] = date
+
+				x= x+1
+
+			orderedContacts = sorted(contacts.values())
+
+#Sort the contact roles			
+			x = 0
+			while x < len(orderedContacts):
+				date = orderedContacts[x]
+
+				for k,v in contacts.items():
+					if v == date:
+						sortedContacts[k] = date
+
+				x=x+1
+
+#iterate through sorted list
+
+			continueFlag = 0
+			
+			for x in sortedContacts.keys():
+
+				try:
+					contactRole = sf.Contact.get(str(x))
+				except Exception, e:
+					exc_type, exc_value, exc_traceback = sys.exc_info()
+					message = "Error getting contact role "+x+" for opportunity "+opportunityId
+					logger.error(str(message))
+					logger.error("Exception for getting contact from contact roles is:", exc_info = (exc_type, exc_value, exc_traceback))
+					sys.exit()
+				else:
+					sourceCampaign = contactRole["Lead_Source_Campaign__c"]
+
+				if setSourceCampaign(sf,sourceCampaign, opportunityId, campaigns) == 1:
+					message = "Successfully added sourceCampaign of x, from contactRole for opp y", sourceCampaign, contactRole["Name"], opportunityId
+					logger.info(message)
+					i = i+1
+					continueFlag = 1
+					break
+
+#id is out of the if and the for loop. It pushes to the next contact role since the campaign was successfully added
+
+			if continueFlag == 1:
+				continue
+
+# else for contactRole number = 0				
+		else:
+			contactId = contactRoles["records"][0]["ContactId"]
+
+			try:
+				firstContact = sf.Contact.get(str(contactId))
+			except Exception, e:
+				exc_type, exc_value, exc_traceback = sys.exc_info()
+				message = "Error getting contact role "+contactId+" for opportunity "+opportunityId
+				logger.error(str(message))
+				logger.error("Exception for getting contact from contact roles is:", exc_info = (exc_type, exc_value, exc_traceback))
+				sys.exit()
+			else:
+				sourceCampaign = firstContact["Lead_Source_Campaign__c"]
+
+			if setSourceCampaign(sf, sourceCampaign, opportunityId, campaigns) == 1:
+				i = i+1
+				continue
+
+		i=i+1
+
+
+
+
+
+
+
+def main():
+
+
+	sfdc_keys = {}
+
+	with open('/mnt/behemoth1/home/bshetti/Documents/sfdcids','r') as f:
+		for line in f:
+			key, value=line.split('=')
+			if key:
+				sfdc_keys[key]=value.strip('\n')
+
+
+	try:
+		sf = Salesforce(username=sfdc_keys['SFDC_USERID'], password=sfdc_keys['SFDC_PASSWORD'], security_token=sfdc_keys['SFDC_TOKEN'])
+	except Exception, e:
+		logger.error(e)
+		sys.exit()
+
+
+
+	logger.info("===================== begin of run ==============")
+	logger.info("syncing source campaigns from pardot to SFDC %s",str(datetime.datetime.now()))
+	
+	campaigns = getCampaigns(sf)
+	if campaigns != 0:
+		logger.debug("%s",json.dumps(campaigns, sort_keys=False, indent=4, separators=(',',':')))
+
+#	sourceCampaign = "Test Pardot Campaign"
+#	if sourceCampaign in campaigns.keys():
+#		print "The pardot campaign is:", campaigns["Test Pardot Campaign"]
+
+
+	opportunity = getOpportunities(sf)
+	if opportunity != 0:
+		logger.debug("%s",json.dumps(opportunity, sort_keys=False, indent=4, separators=(',',':')))
+
+
+#	print opportunity[0]["Name"]
+	changeCampaign(sf,campaigns, opportunity)
+
+
+
+
+
+	logger.info("====end of run===========================")
+
+ 
+if __name__ == '__main__':
+    main()
+

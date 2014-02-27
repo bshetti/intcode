@@ -1,0 +1,390 @@
+#!/usr/bin/python
+# This script helps create a crucible review with a patch file. 
+from __future__ import with_statement
+#import ipdb; ipdb.set_trace()
+import sys
+import os
+import argparse
+import string
+from datetime import datetime
+from fabric.api import local, settings, abort
+from fabric.state import output
+# REST Client
+import requests
+from requests.auth import HTTPBasicAuth
+
+# serialize stuff
+import json
+
+# Reinitialize httplib2 because .cache dirs suck
+import httplib2
+
+# get urllib for downloading urls
+import urllib2
+
+
+# Play nice with 'with' statements
+from contextlib import contextmanager
+
+#namedtuple
+import collections
+
+from collections import namedtuple
+
+# import Jira library
+from jira.client import JIRA
+
+#import a password read mechanism
+import getpass
+
+
+zenTicket = collections.namedtuple('zenTicket', 'subject desc priority num')
+createJticketStatus = collections.namedtuple('createJticketStatus', 'status num url')
+
+def parse_args():
+    #defining and parsing arguments from the command line
+    parser = argparse.ArgumentParser (description = 'Type in your jira user name  and password --user, --password, zendesk ticket number to convert')
+    parser.add_argument('-u', '--user', help= "your jira user name")
+    parser.add_argument('-p' , '--password', help="your jira password")
+    parser.add_argument('-t', '--zTicketNum', help="the Ticket to review - required")
+    return parser.parse_args()
+
+def check_args(args):
+
+	args.user = getpass.getuser()
+	print "Type in Jira Password for ", args.user 
+	args.password = getpass.getpass()
+#	if args.user and args.password and args.title and args.patch:
+
+	headers = {'content-type': 'application/json'}
+	getUrl = 'http://YOURJIRASERVER:8060/rest-service/auth-v1/login?userName='+args.user+'&password='+args.password
+
+	r = requests.get(getUrl, headers=headers)
+	if r.status_code != 200:
+		print "password incorrect"
+		sys.exit(0)
+
+	if args.user and args.password and args.zTicketNum:
+		return 1
+	else:
+		return 0
+
+
+def getZticket(args):
+
+	zTicket = zenTicket('','','','')
+	zenOutput = requests.get('https://company.zendesk.com/api/v2/tickets/'+args.zTicketNum+'.json', auth=HTTPBasicAuth('user', 'password'))
+
+
+	if zenOutput.status_code == 200:
+#		zenOutput.encoding = 'utf-8'
+		zenData = zenOutput.json()
+
+		for field in ("subject", "description", "priority", "id"):
+			potentialError = 0
+			while potentialError < 7:
+				try:
+					str(zenData["ticket"][field])
+				except UnicodeEncodeError, uee:
+					zenData["ticket"][field] = "%s%s" % (uee.object[:uee.start], uee.object[uee.end:])
+					potentialError = potentialError + 1
+				else:
+					potentialError = 7
+
+
+
+		zTicket = zTicket._replace(subject = str(zenData["ticket"]["subject"]))
+#		tempDescription = str(zenData["ticket"]["description"]).encode('utf8')
+		zTicket = zTicket._replace(desc = str(zenData["ticket"]["description"]))
+		zTicket = zTicket._replace(priority = str(zenData["ticket"]["priority"]))
+		zTicket = zTicket._replace(num = str(zenData["ticket"]["id"]))
+#		print zTicket.subject, zTicket.desc, zTicket.priority, zTicket.num
+		return zTicket
+	else:
+		print 'Error from get request into Zendesk', zenOutput.status_code
+
+
+def convertPriority(zTicket):
+	if zTicket.priority == 'high':
+		return 3
+	elif zTicket.priority == 'urgent':
+		return 2
+	elif zTicket.priority == "normal":
+		return 4
+	elif zTicket.priority == "low":
+		return 5
+	else:
+		return 5
+
+def addJinfoToZ(zTicket, createStatus):
+	zenPayload = {'ticket': {'status': 'open', 'comment': {'body': createStatus.url, 'public': 'false'}}}
+	headers = {'content-type': 'application/json'}
+	rPutComment = requests.put('https://yourcompany.zendesk.com/api/v2/tickets/'+zTicket.num+'.json', data=json.dumps(zenPayload), headers=headers, auth=HTTPBasicAuth('user', 'password'))
+	if rPutComment.status_code == 200:
+		zenPayload = {"ticket":{"custom_fields":[{"id":22419508, "value":str(createStatus.num)}] }}
+		rPutJNum = requests.put('https://yourcompany.zendesk.com/api/v2/tickets/'+zTicket.num+'.json', data=json.dumps(zenPayload), headers=headers, auth=HTTPBasicAuth('user', 'password'))
+		if rPutJNum.status_code == 200:
+			return 1
+		else:
+			print "Inserting Jira number failed:", rPutJNum.json()
+	else:
+		print "Inserting comment into Zendesk failed:", rPutComment.json()
+	return 0
+
+def createJiraTicket(zTicket, args):
+	createStatus = createJticketStatus('','','')
+	headers = {'content-type': 'application/json'}
+	zTicketUrl = 'https://yourcompany.zendesk.com/agent/#/tickets/'+zTicket.num
+	payloadData = { "fields":{  "issuetype":{"id":"1"}, "customfield_10601":zTicketUrl , "priority":{"id":str(zTicket.priority)}, "summary":zTicket.subject, "project":{"key":"CI"}, "description":zTicket.desc, "reporter":{"name":str(args.user)}}}
+	r= requests.post('http://YOURJIRASERVER:8080/rest/api/2/issue', data=json.dumps(payloadData), headers=headers, auth=HTTPBasicAuth('user','password'))
+	if r.status_code == 201:
+		print "Jira creation successful"
+#		print r.json()
+		jTicketData = r.json()
+		print "Jira Ticket is :", str(jTicketData["key"])
+		createStatus = createStatus._replace( status = r.status_code)
+		createStatus = createStatus._replace( num = str(jTicketData["key"]))
+		createStatus = createStatus._replace( url = "https://yourcompany.com/browse/"+str(jTicketData["key"]))
+		addJinfoToZ(zTicket, createStatus)
+
+		return createStatus
+
+	else:
+		print "Jira creation unsuccessful"
+		print r.json()
+		createStatus = createStatus._replace(status = 0)
+		return createStatus
+
+
+def zlistOfAttachments(zTicketNum):
+
+	zaudit = requests.get('https://yourcompany.zendesk.com/api/v2/tickets/'+zTicketNum+'/audits.json', auth=HTTPBasicAuth('user', 'password'))
+	if zaudit.status_code != 200:
+		print "Could not get audits for zen ticket number"+zTicketNum
+		return 0
+	else:
+
+
+	# print json.dumps(zaudit.json(), sort_keys=False, indent=4, separators=(',',':'))
+
+		zendata = zaudit.json()
+
+		count = str(zendata["count"])
+		count = int(count)
+
+		auditNum = 0
+
+		listOfAttachments = []
+
+# loop through audits
+		for auditNum in range(0, count):
+
+# loop through events
+			i= 0
+			while i > -1:
+				try:
+					event = str(zendata["audits"][auditNum]["events"][i])
+#					print "event #"+str(i)+" in audit "+str(auditNum)
+# loop through attachments
+				except IndexError:
+					i = -1
+				else:
+
+					attachment = 0
+
+					if event.find("u'attachments") > 0:
+#						print "Event x in audit y "+str(i)+str(auditNum)+"has attachment"
+
+						while attachment > -1:
+							try:
+								attachId = str(zendata["audits"][auditNum]["events"][i]["attachments"][attachment]["id"])
+#								print attachId
+							except IndexError:
+								attachment = -1
+							else:
+								listOfAttachments.append(attachId)
+								attachment = attachment + 1
+					i=i+1
+				
+# print listOfAttachments
+	return listOfAttachments
+
+
+
+def copyAttachments(zTicketNum, jiraTicketNum, args):
+
+	listOfAttachments = zlistOfAttachments(zTicketNum)
+	print listOfAttachments
+	if len(listOfAttachments) == 0:
+		print "Zen Ticket "+zTicketNum+" has no attachments"
+		return 0
+	else:
+
+		attachId = 0
+
+		for attachId in listOfAttachments:
+			zattachInfo = requests.get('https://yourcompany.zendesk.com/api/v2/attachments/'+attachId+'.json', auth=HTTPBasicAuth('user', 'password'))
+			if zattachInfo.status_code != 200:
+				print "Could not get attachment "+attachId+" for zenTicket "+zTicketNum
+			else:
+				attachInfo = zattachInfo.json()
+#		print attachInfo
+				contentUrl = str(attachInfo["attachment"]["content_url"])
+				contentFilename = str(attachInfo["attachment"]["file_name"])
+#		print "URL for attachment is ", contentUrl
+
+				
+				try: 
+					downloadfile = urllib2.urlopen(contentUrl)
+				except urllib2.HTTPError, e:
+					print "Error couldn't download file from zendesk url!"
+					checksLogger.error('HTTPError = ' + str(e.code))
+				except urllib2.URLError, e:
+					print "Error couldn't download file from zendesk url!"
+					checksLogger.error('URLError = ' + str(e.reason))
+				except httplib.HTTPException, e:
+					print "Error couldn't download file from zendesk url!"
+					checksLogger.error('HTTPException')
+				else:
+					try:
+						output = open('/tmp/'+contentFilename,'w')
+						output.write(downloadfile.read())
+					except IOError:
+						print "Error can't open file "+contentFilename+" in /tmp or write it!"
+					else:
+						print "Written "+contentFilename+" successfully to /tmp"
+						output.close()
+
+						try:
+							input = open('/tmp/'+contentFilename, 'rb')
+						except IOError:
+							print "Could not open "+contentFilename+" to write to jira from /tmp"
+						else:
+							jira = JIRA(options = {'server': 'http://YOURJIRASERVER.com:8080'}, basic_auth=(str(args.user), str(args.password)))
+							issue = jira.issue(jiraTicketNum)
+							req = jira.add_attachment(issue, input, contentFilename)
+							input.close()
+
+						os.remove('/tmp/'+contentFilename)
+		return 1
+
+def copyComments(zTicketNum, jiraTicketNum, args):
+
+	zaudit = requests.get('https://yourcompany.zendesk.com/api/v2/tickets/'+zTicketNum+'/audits.json', auth=HTTPBasicAuth('user', 'password'))
+	if zaudit.status_code != 200:
+		print "Could not get audits for zen ticket number"+zTicketNum
+		return 0
+	else:
+
+
+	# print json.dumps(zaudit.json(), sort_keys=False, indent=4, separators=(',',':'))
+
+		zendata = zaudit.json()
+
+		count = str(zendata["count"])
+		count = int(count)
+
+		auditNum = 0
+
+		listOfComments = []
+
+# loop through audits
+		for auditNum in range(0, count):
+
+# loop through events
+			i= 0
+			while i > -1:
+				try:
+					event = str(zendata["audits"][auditNum]["events"][i])
+
+#					print "i = ", str(i)
+#					print "event #"+str(i)+" in audit "+str(auditNum)
+				except IndexError:
+					i = -1
+				else:					
+					if event.find(" u'type': u'Comment'") > 0:
+						if(auditNum != 0):
+							potentialError = 0
+							while potentialError < 10:
+								try:
+									str(zendata["audits"][auditNum]["events"][i]["body"])
+								except UnicodeEncodeError, uee:
+									zendata["audits"][auditNum]["events"][i]["body"] = "%s%s" % (uee.object[:uee.start], uee.object[uee.end:])
+									potentialError = potentialError +1
+								else:
+									potentialError = 10
+							theComment = zendata["audits"][auditNum]["events"][i]["body"]
+							publicFlag = str(zendata["audits"][auditNum]["events"][i]["public"])
+							dateTime = str(zendata["audits"][auditNum]["created_at"])
+							authorId = str(zendata["audits"][auditNum]["author_id"])
+							authorRequest = requests.get('https://yourcompany.zendesk.com/api/v2/users/'+authorId+'.json', auth=HTTPBasicAuth('user', 'password'))
+							if authorRequest.status_code == 200:
+								authorData = authorRequest.json()
+								authorName = str(authorData["user"]["name"])
+							else:
+								print "Could not find author with ID", authorId
+#							print publicFlag, dateTime, authorName
+							if publicFlag == 'True':
+								listOfComments.append("======\nDate&Time:"+dateTime+"\nAuthor:"+authorName+"\n"+theComment+"\n")
+					i=i+1
+
+	if listOfComments == 0:
+		print "listOfComments returned nothing"
+		return 1
+	else:
+		i=0
+    	print "The number of comments is: ", str(len(listOfComments))
+
+    	jiraTicketComment = ""
+    	while i < len(listOfComments):
+    		jiraTicketComment = jiraTicketComment+"Comment Number "+str(i)+"  "+listOfComments[i]+"\n"
+#    		print "Comment Number "+str(i)+"  "+listOfComments[i]
+    		i=i+1
+
+    	headers = {'content-type': 'application/json'}
+    	payloadData = { "body":jiraTicketComment }
+    	r= requests.post('http://YOURJIRASERVER:8080/rest/api/2/issue/'+jiraTicketNum+'/comment', data=json.dumps(payloadData), headers=headers, auth=HTTPBasicAuth('user','password'))
+    	if r.status_code != 201:
+    		print "Adding comment to jira failed"
+    		return 0
+    	else:
+    		print "Comments added"
+
+
+
+# return listOfComments
+	return 1
+
+
+def main():
+    args = parse_args()
+    if check_args(args):
+#    	print "First Two entered parameters:", args.user, args.password, args.title
+    	zTicketInfo = getZticket(args)
+#    	print "Outof getTicket", zTicketInfo.subject
+    	zTicketInfo = zTicketInfo._replace(priority = convertPriority(zTicketInfo))
+#    	print "Converted ticket priority is:", zTicketInfo.priority
+
+    	#createStatus = createJticketStatus('1','JT-30','google')
+    	createStatus = createJiraTicket(zTicketInfo, args)
+ 
+    	if createStatus.status != 0:
+    		print "Browse URL is:", createStatus.url
+
+    		if copyComments(zTicketInfo.num, createStatus.num, args):
+    			print "Rest of zendesk comments added"
+    		else:
+    			print "Rest of zendesk comments NOT added"
+
+
+    		if copyAttachments(zTicketInfo.num, createStatus.num, args):
+    			print "Successfully attached"
+    		else:
+    			print "Either no attachments or one of the attachments was not copied into jira"
+
+
+    else:
+		print "Missing parameters"
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,457 @@
+#!/usr/bin/python
+# This script helps create a crucible review with a patch file.
+
+from __future__ import with_statement
+#import ipdb; ipdb.set_trace()
+import sys
+import traceback
+import os
+import argparse
+import string
+import subprocess
+import tempfile
+from datetime import datetime
+#from fabric.api import local, settings, abort
+#from fabric.state import output
+# REST Client
+import requests
+from requests.auth import HTTPBasicAuth
+
+# serialize stuff
+import json
+
+# Reinitialize httplib2 because .cache dirs suck
+import httplib2
+
+# get urllib for downloading urls
+import urllib2
+
+import urllib
+from urllib import quote
+
+
+
+# Play nice with 'with' statements
+from contextlib import contextmanager
+
+#namedtuple
+import collections
+
+from collections import namedtuple
+
+#import a password read mechanism
+import getpass
+
+from simple_salesforce import Salesforce
+
+import datetime
+import math
+from math import ceil
+
+import logging
+#logging info
+logging.basicConfig()
+logger = logging.getLogger("sync-campaign")
+hdlr = logging.FileHandler("/home/bshetti/log/sync-campaign.log")
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+hdlr.setFormatter(formatter)
+logger.addHandler(hdlr)
+logger.setLevel(logging.DEBUG)
+logger.propagate = False
+
+
+
+def getCampaigns(sf):
+
+	campaigns = {}
+
+	query = "SELECT Campaign.Name, Campaign.Id FROM Campaign"
+
+	try:
+		output = sf.query(str(query))
+	except Exception, e:
+		logger.error(e)
+		sys.exit(1)
+
+	try:
+		totalSize = output["totalSize"]
+	except Exception, e:
+		exc_type, exc_value, exc_traceback = sys.exc_info()
+		logger.error("The errors for getting totalSize in getCampaigns are:", exc_info = (exc_type, exc_value, exc_traceback))
+		logger.error("Exiting getCampaign")
+		sys.exit()
+
+
+
+	if totalSize == 0:
+		logger.error("Could not find campaigns in salesforce")
+	else:
+
+		i = 0
+
+		while i > -1:
+			try:
+				campaignName = str(output["records"][i]["Name"]).encode('ascii')
+
+			except IndexError:
+				i = -1
+
+			else:
+				campaignId = str(output["records"][i]["Id"]).encode('ascii')
+				campaigns[campaignName] = campaignId
+				i = i+1
+
+	return campaigns
+
+
+
+pardotCallKey = ""
+
+def getProspects(call_key):
+
+	prospects = {}
+
+	createdAtDate = "2014-01-01 08:30:01"
+
+	codedDate = urllib.quote(str(createdAtDate),'')
+
+#	print "Created At Date", codedDate
+
+	prospectQuery = "https://pi.pardot.com/api/prospect/version/3/do/query?format=json&"+ \
+		"fields=first_name,last_name, Source_Campaign, crm_lead_fid, crm_contact_fid, created_at&"+ \
+		"created_after="+str(codedDate)+"&sort_by=created_at&sort_order=ascending&"+call_key
+
+
+	try:
+		r=requests.post(prospectQuery)
+	except Exception, e:
+		exc_type, exc_value, exc_traceback = sys.exc_info()
+		logger.error("The error from getting prospects is/are:", exc_info = (exc_type, exc_value, exc_traceback))
+		logger.error("Exiting getCampaign")
+		sys.exit()
+	else:
+		if r.status_code == 500:
+			logger.error("getting prospects returned nothing from API - 500 error")
+			sys.exit()
+
+
+
+	prospectData = r.json()
+
+#	print prospectData["result"]["prospect"][1].keys()
+
+#	print json.dumps(prospectData, sort_keys=False, indent=4, separators=(',',':'))
+
+	try:
+		totalResults = prospectData["result"]["total_results"]
+	except Exception, e:
+		exc_type, exc_value, exc_traceback = sys.exc_info()
+		logger.error("The error from getting prospects is/are:", exc_info = (exc_type, exc_value, exc_traceback))
+		logger.error("Exiting getCampaign")
+		sys.exit()
+
+
+
+
+	i = 0
+	pi = 0
+
+
+#	remainder = totalResults % 200
+#	maxCi = ceil(totalResults/200.0)
+
+	i = 0
+	subi = 0
+	pi = 0
+	ci = 0
+
+
+	logger.debug("Total results from first call is %s", str(totalResults))
+
+	while i < totalResults:
+#		print "source campaign", prospectData["result"]["prospect"][i]["Source_Campaign"]
+	
+		try:
+			prospectData["result"]["prospect"][subi]["Source_Campaign"]
+		except KeyError:
+			prospects[pi] = prospectData["result"]["prospect"][subi]
+			pi=pi+1
+		else:
+			message = "Prospect "+str(prospectData["result"]["prospect"][subi]["id"])+" has a source"
+			logger.debug(message)
+
+		logger.debug("in loop %s",str(i))
+
+		i = i+1
+		subi = subi +1
+
+		if (i%200)== 0:
+			subi = 0
+			offset = i
+
+			prospectQuery = "https://pi.pardot.com/api/prospect/version/3/do/query?format=json&"+ \
+				"fields=first_name,last_name, Source_Campaign, crm_lead_fid, crm_contact_fid, created_at&"+ \
+				"created_after="+str(codedDate)+"&offset="+str(offset)+"&sort_by=created_at&sort_order=ascending&"+call_key
+
+
+			try:
+				r=requests.post(prospectQuery)
+			except Exception, e:
+				exc_type, exc_value, exc_traceback = sys.exc_info()
+				logger.error("The error from getting prospects is/are:", exc_info = (exc_type, exc_value, exc_traceback))
+				logger.error("Exiting getCampaign")
+				sys.exit()
+			else:
+				if r.status_code == 500:
+					logger.error("getting prospects returned nothing from API - 500 error")
+					sys.exit()
+
+
+
+			prospectData = r.json()
+
+
+
+	logger.info("Processed %s prospect records from Pardot", str(i))
+	logger.info("get prospect finished, and found %s records without a Source Campaign", str(pi))
+
+	return prospects
+
+
+def getSourceCampaign(activity):
+
+	sourceCampaign = {}
+
+	totalActivities = len(activity)
+
+	i=0
+
+	while i < totalActivities:
+
+		if activity[i]["type"] == 4:
+			logger.info("Source is %s", activity[i]["campaign"]["name"])
+			sourceCampaign["id"] = activity[i]["campaign"]["id"]
+			sourceCampaign["name"] = activity[i]["campaign"]["name"]
+			return sourceCampaign
+		i=i+1
+
+	return sourceCampaign
+
+
+
+def getActivity(prospectId, call_key):
+
+	activity = {}
+
+	activityQuery = "https://pi.pardot.com/api/visitorActivity/version/3/do/query?format=json&"+ \
+		"prospect_only=true&prospect_id="+str(prospectId)+"&"+call_key
+	
+
+	try:
+		r=requests.post(activityQuery)
+	except Exception, e:
+		logger.error("Issue getting activities for %s", str(prospectId))
+		exc_type, exc_value, exc_traceback = sys.exc_info()
+		logger.error("The error from getting activities is/are:", exc_info = (exc_type, exc_value, exc_traceback))
+		logger.error("Exiting run")
+		sys.exit()
+
+
+	if r.status_code != 200:
+		logger.error("activity NOT found for prospect %s:", prospectId)
+		return activity
+
+	activityData = r.json()
+
+	totalActivities = activityData["result"]["total_results"]
+
+#	print "Total Activity of "+str(totalActivities)+" and the Activity for prospect:"+str(prospectId)+"is:"
+
+#	print json.dumps(activityData, sort_keys=False, indent=4, separators=(',',':'))
+
+	i = 0
+	while i < totalActivities:
+
+#		print "attaching activity:"+str(i)+"for id:"+str(prospectId)
+		if totalActivities == 1:
+			activity [i] = activityData["result"]["visitor_activity"]
+			i = 5000
+		else:
+			activity[i] = activityData["result"]["visitor_activity"][i]
+			i=i+1
+
+	return activity
+
+
+
+
+
+def calSource(prospects, call_key):
+
+	prospectSource = {}
+
+	totalProspects = len(prospects)
+
+	i=0
+	pi=0
+
+	while i < totalProspects:
+
+		sourceInfo = {}
+
+
+		prospectId = prospects[i]["id"]
+
+		logger.debug("In calSource for prospect %s", prospectId)
+
+	
+		activity = getActivity(prospectId, call_key)
+
+#		print "Activity for prospect:"+str(prospectId)+" is:",activity
+
+#		print "The Source Campaign for:"+str(prospectId)+" is:"
+		if len(activity) == 0:
+			logger.error("No activity found for %s", prospectId)
+			i = i+1
+			continue
+
+		sourceCampaign = getSourceCampaign(activity)
+
+		if len(sourceCampaign) != 0:
+			sourceInfo["prospect_id"] = str(prospectId)
+			sourceInfo["campaign"] = sourceCampaign
+			prospectSource[pi] = sourceInfo
+			pi = pi+1
+		else:
+			logger.info("source campaign for %s not found", prospectId)
+
+
+		i = i+1
+
+	return prospectSource
+
+
+def loginPardotApi():
+
+
+	pardot_keys = {}
+
+
+	with open('/mnt/behemoth1/home/bshetti/pardotids','r') as f:
+		for line in f:
+			key, value=line.split('=')
+			if key:
+				pardot_keys[key]=value.strip('\n')
+
+
+	request_string = "https://pi.pardot.com/api/login/version/3?format=json&email="+pardot_keys['PARDOT_USERID']+"&password="+pardot_keys['PARDOT_PASSWORD']+"&user_key="+pardot_keys['PARDOT_TOKEN']
+
+
+	r = requests.post(request_string)
+
+	loginData = r.json()
+
+	api_key = loginData["api_key"]
+
+	call_key="user_key="+pardot_keys['PARDOT_TOKEN']+"&api_key="+api_key
+
+	return call_key
+
+
+def changeSource(prospectSource, campaigns, call_key):
+
+	totalItems = len(prospectSource)
+
+	i= 0
+
+	if totalItems == 0:
+		logger.info("No prospects with a potential campaign source, so nothing updated")
+		return
+
+
+	while i < totalItems:
+
+		prospectId = prospectSource[i]["prospect_id"]
+
+		try:
+			sourceCampaign = prospectSource[i]["campaign"]["name"]
+		except TypeError:
+			logger.error("In changeSource, and we got a null value for %s", prospectId)
+		else:
+
+#			if sourceCampaign in campaigns.keys():
+
+				codedCampaign = urllib.quote(str(sourceCampaign),'')
+
+				prospectQuery = "https://pi.pardot.com/api/prospect/version/3/do/update/id/"+str(prospectId)+\
+					"?Source_Campaign="+codedCampaign+"&"+call_key
+
+				r=requests.post(prospectQuery)
+
+	#			prospectData = r.json()
+				logger.debug("finished updating prospect and return code was %s", r.status_code)
+
+				if r.status_code == 200:
+					logger.info("Prospect: %s updated",str(prospectId))
+				else:
+					logger.info("Prospect: %s NOT updated",str(prospectId))
+#			else:
+#				print "Campaign "+sourceCampaign+" not in SFDC so not updated"
+
+		i=i+1
+
+
+
+def main():
+
+	logger.info("===================== begin of run ==============")
+	logger.info("syncing source campaigns from pardot to SFDC %s",str(datetime.datetime.now()))
+
+	sfdc_keys = {}
+
+	with open('/mnt/behemoth1/home/bshetti/sfdcids','r') as f:
+		for line in f:
+			key, value=line.split('=')
+			if key:
+				sfdc_keys[key]=value.strip('\n')
+
+
+	try:
+		sf = Salesforce(username=sfdc_keys['SFDC_USERID'], password=sfdc_keys['SFDC_PASSWORD'], security_token=sfdc_keys['SFDC_TOKEN'])
+	except Exception, e:
+		logger.error(e)
+		sys.exit()
+
+	campaigns = getCampaigns(sf)
+	if campaigns != 0:
+		logger.debug(campaigns)
+
+	call_key = loginPardotApi()
+
+	print "call_key=",call_key
+
+#	pardotCallKey = call_key
+
+	print "call_key=", call_key
+
+	prospects = getProspects(call_key)
+	logger.debug(json.dumps(prospects, sort_keys=False, indent=4, separators=(',',':')))
+
+
+	prospectSource = calSource(prospects, call_key)
+
+
+	logger.info("list of prospects with a campaign source %s", json.dumps(prospectSource, sort_keys=False, indent=4, separators=(',',':')))
+
+
+	changeSource(prospectSource, campaigns, call_key)
+
+
+
+
+	logger.info("====end of run===========================")
+
+ 
+if __name__ == '__main__':
+    main()
+
